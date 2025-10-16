@@ -1,8 +1,7 @@
-
 import os
 from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse, JSONResponse
-from twilio.twiml.voice_response import VoiceResponse, Start
+from fastapi.responses import PlainTextResponse
+from twilio.twiml.voice_response import VoiceResponse
 
 app = FastAPI()
 
@@ -13,17 +12,12 @@ def health():
 @app.post("/voice")
 async def voice(request: Request):
     # Twilio hits this when a call arrives.
-    # It returns TwiML that starts a realtime media stream to our /ws endpoint.
     base = os.environ.get("BASE_URL", "https://example.com")
     vr = VoiceResponse()
-    start = Start()
-    # IMPORTANT: Twilio requires wss. Render gives you https -> use same host for wss.
-    host = base.replace("https://", "").replace("http://", "")
-    start.stream(url=f"wss://{host}/ws")
-    vr.append(start)
-    vr.say("Hi, connecting you now.")
+    vr.say("Connecting you now.")
+    vr.connect().stream(url=f"wss://{base.split('://')[1]}/ws")
     return PlainTextResponse(str(vr), media_type="application/xml")
 
-# NOTE: The /ws endpoint is implemented in realtime.py (to be filled later with realtime AI wiring).
+# --- include realtime route ---
 from realtime import router as realtime_router
 app.include_router(realtime_router)
