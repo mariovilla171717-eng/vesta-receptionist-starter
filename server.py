@@ -25,3 +25,5 @@ async def voice(request: Request):
     return PlainTextResponse(str(vr), media_type="application/xml")
 
 # NOTE: The /ws endpoint is implemented in realtime.py (to be filled later with realtime AI wiring).
+from realtime import router as realtime_router
+app.include_router(realtime_router)
