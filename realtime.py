@@ -1,4 +1,4 @@
-# realtime.py — Twilio bidirectional stream <-> OpenAI Realtime (μ-law 8k), audio guaranteed
+# realtime.py — Twilio <-> OpenAI Realtime (PCMU μ-law 8k), using official session schema
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 import asyncio, os, json, websockets
@@ -7,25 +7,33 @@ router = APIRouter()
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 
 async def connect_openai():
-    url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+    # Use the GA model & session schema Twilio shows in their Python guide
+    url = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
     headers = {
         "Authorization": f"Bearer {OPENAI_KEY}",
-        "OpenAI-Beta": "realtime=v1",
     }
     ws = await websockets.connect(url, extra_headers=headers)
 
-    # Configure session: μ-law 8kHz in/out + server VAD + a natural voice
+    # Session: server VAD; input/output = audio/pcmu (G.711 μ-law 8k); audio modality; voice
     await ws.send(json.dumps({
         "type": "session.update",
         "session": {
-            "turn_detection": {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 150, "silence_duration_ms": 350},
-            "input_audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000},
-            "output_audio_format": {"type": "g711_ulaw", "sample_rate_hz": 8000},
-            "voice": "alloy",
+            "type": "realtime",
+            "model": "gpt-realtime",
+            "output_modalities": ["audio"],
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcmu"},
+                    "turn_detection": {"type": "server_vad"}
+                },
+                "output": {
+                    "format": {"type": "audio/pcmu"},
+                    "voice": "alloy"
+                }
+            },
             "instructions": (
                 "You are a premium human receptionist for Vesta. "
-                "Sound warm and human, keep answers short, ask one question at a time. "
-                "React quickly; do not pause like voicemail."
+                "Sound warm and human, keep answers short, ask one question at a time, and react quickly."
             ),
         }
     }))
@@ -36,24 +44,18 @@ async def ws_endpoint(twilio_ws: WebSocket):
     await twilio_ws.accept()
     stream_sid = None
 
-    # 1) Wait for Twilio "start" to get streamSid
-    async def read_twilio_start():
-        nonlocal stream_sid
-        while stream_sid is None:
-            msg = await twilio_ws.receive_text()
-            data = json.loads(msg)
-            if data.get("event") == "start":
-                stream_sid = data["start"]["streamSid"]
-                break
-    await read_twilio_start()
+    # Wait for Twilio 'start' to get the streamSid
+    while stream_sid is None:
+        start_msg = await twilio_ws.receive_text()
+        start_data = json.loads(start_msg)
+        if start_data.get("event") == "start":
+            stream_sid = start_data["start"]["streamSid"]
 
-    # 2) Connect to OpenAI
     openai_ws = await connect_openai()
 
-    # Auto-commit after brief silence, so the bot responds quickly
+    # Auto-commit after brief silence to trigger replies fast
     silence_delay_ms = 450
     commit_task = None
-    commit_lock = asyncio.Lock()
 
     async def schedule_commit():
         nonlocal commit_task
@@ -64,25 +66,21 @@ async def ws_endpoint(twilio_ws: WebSocket):
     async def commit_after_delay():
         try:
             await asyncio.sleep(silence_delay_ms / 1000)
-            async with commit_lock:
-                await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                # Ask specifically for AUDIO output to guarantee speech
-                await openai_ws.send(json.dumps({
-                    "type": "response.create",
-                    "response": {"modalities": ["audio"]}
-                }))
+            await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+            await openai_ws.send(json.dumps({"type": "response.create"}))
         except asyncio.CancelledError:
-            pass
-        except Exception:
             pass
 
     async def twilio_to_openai():
-        """Caller audio -> OpenAI (μ-law pass-through) + immediate greeting"""
+        """Caller audio -> OpenAI (pass-through μ-law base64 from Twilio). Also send a greeting immediately."""
         try:
-            # Say hello immediately so the line isn't silent
+            # Non-silent greeting so caller hears the bot right away
             await openai_ws.send(json.dumps({
                 "type": "response.create",
-                "response": {"modalities": ["audio"], "instructions": "Hi, thanks for calling Vesta. How can I help you today?"}
+                "response": {
+                    "modalities": ["audio"],
+                    "instructions": "Hi, thanks for calling Vesta. How can I help you today?"
+                }
             }))
 
             while True:
@@ -92,51 +90,48 @@ async def ws_endpoint(twilio_ws: WebSocket):
                 if ev == "media":
                     await openai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
-                        "audio": data["media"]["payload"]  # μ-law base64 from Twilio
+                        "audio": data["media"]["payload"]  # base64 μ-law from Twilio
                     }))
                     await schedule_commit()
                 elif ev == "stop":
                     break
-                # ignore marks/others
         except WebSocketDisconnect:
             pass
         finally:
             try:
                 await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                await openai_ws.send(json.dumps({"type": "response.create", "response": {"modalities": ["audio"]}}))
+                await openai_ws.send(json.dumps({"type": "response.create"}))
             except:
                 pass
 
     async def openai_to_twilio():
-        """OpenAI audio -> Twilio (μ-law base64 in 'media' frames)."""
+        """OpenAI audio -> Twilio as 'media' frames (μ-law base64)."""
         try:
             async for message in openai_ws:
                 event = json.loads(message)
                 t = event.get("type")
 
-                # Support both legacy and new event names
-                if t in ("response.output_audio.delta", "response.audio.delta"):
-                    audio_b64 = event.get("audio") or event.get("delta")
-                    await twilio_ws.send_text(json.dumps({
-                        "event": "media",
-                        "streamSid": stream_sid,
-                        "media": {"payload": audio_b64}
-                    }))
+                # GA event name for audio chunks:
+                if t == "response.output_audio.delta":
+                    # Twilio expects: {"event":"media","streamSid":...,"media":{"payload":<base64 μ-law>}}
+                    payload_b64 = event.get("delta")
+                    if payload_b64:
+                        await twilio_ws.send_text(json.dumps({
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {"payload": payload_b64}
+                        }))
 
-                elif t in ("response.output_audio.done", "response.audio.done"):
-                    # Turn finished: clear input buffer so we can listen again
-                    try:
-                        await openai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
-                    except:
-                        pass
+                elif t == "response.output_audio.done":
+                    # turn finished; clear so we can listen for next user turn
+                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
 
-                # (Optional) If you want to log text: handle "response.text.delta" here.
         except Exception:
             pass
 
     await asyncio.gather(twilio_to_openai(), openai_to_twilio())
 
-    # Cleanup
+    # cleanup
     try: await openai_ws.close()
     except: pass
     try: await twilio_ws.close()
