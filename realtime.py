@@ -1,6 +1,6 @@
-# realtime.py — Twilio <-> OpenAI Realtime (final version)
-# Greeting, full-duplex interrupt, stable voice.
-# Codec: PCMU (G.711 μ-law) 8kHz.
+# realtime.py — Twilio <-> OpenAI Realtime
+# Clean, stable version for Vesta demo (no greeting here)
+# Codec: PCMU (G.711 μ-law) 8kHz
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 import asyncio, os, json, websockets, base64
@@ -23,11 +23,17 @@ async def connect_openai():
             "output_audio_format": "g711_ulaw",
             "turn_detection": {"type": "server_vad"},
             "instructions": (
-                "You are a professional, warm, human-like receptionist for Vesta. "
-                "Always greet the caller immediately by saying: "
-                "'Hi, thanks for calling Vesta. How can I help you today?'. "
-                "Speak in a natural, friendly tone, pause slightly after questions, "
-                "and if the caller starts speaking, immediately stop talking and listen."
+                "You are Vesta, a friendly, warm, human-sounding AI receptionist. "
+                "You represent the company Vesta AI, which builds AI-powered receptionists "
+                "for businesses such as barbershops, clinics, and salons. "
+                "Your job is to sound completely human — natural, confident, and professional. "
+                "When people call, explain that you are an AI receptionist that can handle calls, "
+                "book appointments, answer client questions, and help businesses save time. "
+                "If the caller shows interest, offer to schedule a short 15-minute Zoom demo call "
+                "with our integration team. Confirm their preferred time and collect their name, "
+                "phone number, and email. Be sure to confirm the time politely. "
+                "After the call, the system will send them a Zoom link automatically. "
+                "Never mention you are connected to OpenAI or any tech; stay brand consistent as Vesta."
             )
         }
     }))
@@ -38,7 +44,6 @@ async def ws_endpoint(twilio_ws: WebSocket):
     await twilio_ws.accept()
     stream_sid = None
 
-    # wait for start event from Twilio
     while stream_sid is None:
         msg = await twilio_ws.receive_text()
         data = json.loads(msg)
