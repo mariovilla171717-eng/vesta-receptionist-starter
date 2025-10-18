@@ -14,11 +14,5 @@ async def voice(request: Request):
     base = os.environ.get("BASE_URL", "https://example.com")
     host = base.split("://")[1]
 
-    vr = VoiceResponse()
-    # Greeting FIRST, handled by Twilio instantly before AI connects
-    vr.say("Hi, thanks for calling Vesta. How can I help you today?", voice="Polly.Joanna", language="en-US")
-    vr.connect().stream(url=f"wss://{host}/ws")
-    return PlainTextResponse(str(vr), media_type="application/xml")
-
 from realtime import router as realtime_router
 app.include_router(realtime_router)
