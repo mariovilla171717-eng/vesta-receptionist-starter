@@ -8,7 +8,7 @@ import asyncio, os, json, websockets, base64
 router = APIRouter()
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 
-# -------- μ-law decode (for barge-in gate) --------
+# -------- μ-law helpers (for barge-in gate) --------
 SIGN_BIT = 0x80
 QUANT_MASK = 0x0F
 BIAS = 0x84
@@ -35,7 +35,7 @@ def rms_from_mulaw_bytes(mu_bytes: bytes) -> float:
 # -------- OpenAI Realtime session --------
 async def connect_openai():
     url = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
-    headers = { "Authorization": f"Bearer {OPENAI_KEY}" }
+    headers = {"Authorization": f"Bearer {OPENAI_KEY}"}
     ws = await websockets.connect(url, extra_headers=headers)
     await ws.send(json.dumps({
         "type": "session.update",
@@ -68,10 +68,11 @@ async def ws_endpoint(twilio_ws: WebSocket):
     await twilio_ws.accept()
     stream_sid = None
 
-    # speaking state and suppression flag for strict half-duplex
+    # --- state (module-level for nonlocal access in inner funcs) ---
     speaking = False
     suppress_outbound = False
     current_response_id = None
+    loud_ms_accum = 0
 
     # --- Twilio start: get streamSid ---
     while stream_sid is None:
@@ -80,9 +81,10 @@ async def ws_endpoint(twilio_ws: WebSocket):
         if start_data.get("event") == "start":
             stream_sid = start_data["start"]["streamSid"]
 
+    # Connect to OpenAI
     openai_ws = await connect_openai()
 
-    # --- guaranteed greeting (dual schema) ---
+    # --- guaranteed greeting (dual schema to be extra safe) ---
     async def send_greeting():
         # Schema A
         await openai_ws.send(json.dumps({
@@ -100,7 +102,6 @@ async def ws_endpoint(twilio_ws: WebSocket):
         }))
 
     await send_greeting()
-    asyncio.create_task(asyncio.sleep(1.5))  # small buffer before listening
 
     # --- quick reply after caller pause ---
     silence_delay_ms = 450
@@ -123,29 +124,28 @@ async def ws_endpoint(twilio_ws: WebSocket):
             pass
 
     async def hard_cancel():
-    """Stop bot speech immediately and cancel the current model turn."""
-    nonlocal speaking, suppress_outbound, current_response_id
-    suppress_outbound = True      # drop any more audio frames from this response
-    speaking = False
-    try:
-        # Try targeted cancel (if we have an id), then generic cancel twice (belt & suspenders)
-        if current_response_id:
-            await openai_ws.send(json.dumps({"type": "response.cancel", "response": {"id": current_response_id}}))
-        await openai_ws.send(json.dumps({"type": "response.cancel"}))
-        await openai_ws.send(json.dumps({"type": "response.cancel"}))
-        # Clear any partial buffers so nothing leftover gets spoken
-        await openai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
-    except:
-        pass
-    current_response_id = None
+        """Stop bot speech immediately and cancel the current model turn."""
+        nonlocal speaking, suppress_outbound, current_response_id
+        suppress_outbound = True          # drop any more audio frames from this response
+        speaking = False
+        try:
+            # Try targeted cancel, then generic cancel (twice for safety), then clear buffers
+            if current_response_id:
+                await openai_ws.send(json.dumps({"type": "response.cancel", "response": {"id": current_response_id}}))
+            await openai_ws.send(json.dumps({"type": "response.cancel"}))
+            await openai_ws.send(json.dumps({"type": "response.cancel"}))
+            await openai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+        except:
+            pass
+        current_response_id = None
 
     # --- barge-in gate (noise immune) ---
-FRAME_MS = 20
-RMS_GATE = 5500          # a bit more sensitive to your voice
-LOUD_MS_REQUIRED = 60    # ~60 ms of sustained voice -> cancel
+    FRAME_MS = 20
+    RMS_GATE = 5500         # lower = more sensitive; raise if it cancels too easily
+    LOUD_MS_REQUIRED = 60   # ms of sustained voice to trigger cancel
 
     async def twilio_to_openai():
-        nonlocal loud_ms_accum, suppress_outbound
+        nonlocal loud_ms_accum, suppress_outbound, speaking
         try:
             while True:
                 msg = await twilio_ws.receive_text()
@@ -156,7 +156,7 @@ LOUD_MS_REQUIRED = 60    # ~60 ms of sustained voice -> cancel
                     mu_b64 = data["media"]["payload"]
                     mu_bytes = base64.b64decode(mu_b64)
 
-                    # Detect caller talking while bot is speaking
+                    # Detect caller voice while bot is speaking
                     if speaking:
                         frame_rms = rms_from_mulaw_bytes(mu_bytes)
                         if frame_rms >= RMS_GATE:
@@ -169,7 +169,7 @@ LOUD_MS_REQUIRED = 60    # ~60 ms of sustained voice -> cancel
                     else:
                         loud_ms_accum = 0
 
-                    # Always send caller audio to model
+                    # Always forward caller audio to model
                     await openai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
                         "audio": mu_b64
@@ -178,6 +178,7 @@ LOUD_MS_REQUIRED = 60    # ~60 ms of sustained voice -> cancel
 
                 elif ev == "stop":
                     break
+
         except WebSocketDisconnect:
             pass
         finally:
@@ -214,11 +215,13 @@ LOUD_MS_REQUIRED = 60    # ~60 ms of sustained voice -> cancel
                     speaking = False
                     current_response_id = None
                     await openai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+
         except Exception:
             pass
 
     await asyncio.gather(twilio_to_openai(), openai_to_twilio())
 
+    # cleanup
     try:
         await openai_ws.close()
     except:
