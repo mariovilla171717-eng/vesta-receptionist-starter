@@ -1,14 +1,14 @@
 # realtime.py — Twilio <-> OpenAI Realtime
-# Fully tuned: instant greeting, strict half-duplex, noise-immune barge-in
+# FINAL STABLE VERSION — reliable greeting + strict half-duplex barge-in
 # Codec: PCMU (G.711 μ-law) 8kHz
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-import asyncio, os, json, websockets, base64
+import asyncio, os, json, websockets, base64, time
 
 router = APIRouter()
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 
-# -------- μ-law helpers (for barge-in gate) --------
+# ---------- μ-law decoding for volume detection ----------
 SIGN_BIT = 0x80
 QUANT_MASK = 0x0F
 BIAS = 0x84
@@ -32,7 +32,7 @@ def rms_from_mulaw_bytes(mu_bytes: bytes) -> float:
         acc += s * s
     return (acc / n) ** 0.5
 
-# -------- OpenAI Realtime session --------
+# ---------- Connect to OpenAI Realtime ----------
 async def connect_openai():
     url = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
     headers = {"Authorization": f"Bearer {OPENAI_KEY}"}
@@ -44,67 +44,56 @@ async def connect_openai():
             "model": "gpt-realtime",
             "output_modalities": ["audio"],
             "audio": {
-                "input": {
-                    "format": {"type": "audio/pcmu"},
-                    "turn_detection": {"type": "server_vad", "silence_duration_ms": 500}
-                },
-                "output": {
-                    "format": {"type": "audio/pcmu"},
-                    "voice": "alloy"
-                }
+                "input": {"format": {"type": "audio/pcmu"}},
+                "output": {"format": {"type": "audio/pcmu"}, "voice": "alloy"}
             },
             "instructions": (
-                "You are a premium human receptionist for Vesta. "
-                "Speak natural English unless the caller clearly prefers another language. "
-                "Be warm, concise, one question at a time, respond quickly. "
-                "If the caller interrupts, stop speaking immediately and listen."
+                "You are a professional, human-sounding receptionist for Vesta. "
+                "Speak clearly and politely in English unless the caller prefers another language. "
+                "Always respond quickly and stop talking immediately if the caller speaks."
             ),
         }
     }))
     return ws
 
+# ---------- WebSocket Endpoint ----------
 @router.websocket("/ws")
 async def ws_endpoint(twilio_ws: WebSocket):
     await twilio_ws.accept()
     stream_sid = None
-
-    # --- state (module-level for nonlocal access in inner funcs) ---
     speaking = False
     suppress_outbound = False
     current_response_id = None
     loud_ms_accum = 0
 
-    # --- Twilio start: get streamSid ---
+    # Get streamSid from Twilio
     while stream_sid is None:
-        start_msg = await twilio_ws.receive_text()
-        start_data = json.loads(start_msg)
-        if start_data.get("event") == "start":
-            stream_sid = start_data["start"]["streamSid"]
+        msg = await twilio_ws.receive_text()
+        data = json.loads(msg)
+        if data.get("event") == "start":
+            stream_sid = data["start"]["streamSid"]
 
-    # Connect to OpenAI
     openai_ws = await connect_openai()
 
-    # --- guaranteed greeting (dual schema to be extra safe) ---
+    # ---------- Reliable Greeting ----------
     async def send_greeting():
+        greeting = "Hi, thank you for calling Vesta. How can I help you today?"
         # Schema A
         await openai_ws.send(json.dumps({
             "type": "response.create",
-            "response": {
-                "modalities": ["audio"],
-                "instructions": "Hi, thanks for calling Vesta. How can I help you today?"
-            }
+            "response": {"modalities": ["audio"], "instructions": greeting}
         }))
         # Schema B
         await openai_ws.send(json.dumps({
             "type": "response.create",
             "modalities": ["audio"],
-            "instructions": "Hi, thanks for calling Vesta. How can I help you today?"
+            "instructions": greeting
         }))
 
     await send_greeting()
 
-    # --- quick reply after caller pause ---
-    silence_delay_ms = 450
+    # ---------- Handle user silence / response timing ----------
+    silence_delay_ms = 400
     commit_task = None
 
     async def schedule_commit():
@@ -117,32 +106,29 @@ async def ws_endpoint(twilio_ws: WebSocket):
         try:
             await asyncio.sleep(silence_delay_ms / 1000)
             await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-            # Dual schema request to guarantee voice output
             await openai_ws.send(json.dumps({"type": "response.create", "response": {"modalities": ["audio"]}}))
             await openai_ws.send(json.dumps({"type": "response.create", "modalities": ["audio"]}))
         except asyncio.CancelledError:
             pass
 
+    # ---------- Immediate Cancel ----------
     async def hard_cancel():
-        """Stop bot speech immediately and cancel the current model turn."""
         nonlocal speaking, suppress_outbound, current_response_id
-        suppress_outbound = True          # drop any more audio frames from this response
+        suppress_outbound = True
         speaking = False
         try:
-            # Try targeted cancel, then generic cancel (twice for safety), then clear buffers
             if current_response_id:
                 await openai_ws.send(json.dumps({"type": "response.cancel", "response": {"id": current_response_id}}))
-            await openai_ws.send(json.dumps({"type": "response.cancel"}))
             await openai_ws.send(json.dumps({"type": "response.cancel"}))
             await openai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
         except:
             pass
         current_response_id = None
 
-    # --- barge-in gate (noise immune) ---
+    # ---------- Barge-in Detection ----------
     FRAME_MS = 20
-    RMS_GATE = 5500         # lower = more sensitive; raise if it cancels too easily
-    LOUD_MS_REQUIRED = 60   # ms of sustained voice to trigger cancel
+    RMS_GATE = 5000       # lower = more sensitive to voice
+    LOUD_MS_REQUIRED = 50 # 50ms of sustained voice triggers cancel
 
     async def twilio_to_openai():
         nonlocal loud_ms_accum, suppress_outbound, speaking
@@ -156,7 +142,7 @@ async def ws_endpoint(twilio_ws: WebSocket):
                     mu_b64 = data["media"]["payload"]
                     mu_bytes = base64.b64decode(mu_b64)
 
-                    # Detect caller voice while bot is speaking
+                    # Detect caller voice
                     if speaking:
                         frame_rms = rms_from_mulaw_bytes(mu_bytes)
                         if frame_rms >= RMS_GATE:
@@ -169,7 +155,7 @@ async def ws_endpoint(twilio_ws: WebSocket):
                     else:
                         loud_ms_accum = 0
 
-                    # Always forward caller audio to model
+                    # Send caller audio to model
                     await openai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
                         "audio": mu_b64
@@ -200,7 +186,7 @@ async def ws_endpoint(twilio_ws: WebSocket):
                     suppress_outbound = False
                     current_response_id = (event.get("response") or {}).get("id") or event.get("id")
 
-                if t == "response.output_audio.delta":
+                elif t == "response.output_audio.delta":
                     if not suppress_outbound:
                         delta_b64 = event.get("delta")
                         if delta_b64:
@@ -221,7 +207,7 @@ async def ws_endpoint(twilio_ws: WebSocket):
 
     await asyncio.gather(twilio_to_openai(), openai_to_twilio())
 
-    # cleanup
+    # ---------- Cleanup ----------
     try:
         await openai_ws.close()
     except:
