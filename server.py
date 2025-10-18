@@ -15,9 +15,7 @@ async def voice(request: Request):
     host = base.split("://")[1]
 
     vr = VoiceResponse()
-    # Twilio speaks this immediately (no waiting on the AI)
-    vr.say("Hi, thanks for calling Vesta. How can I help you today?")
-    # Start the bidirectional stream right after the greeting
+    # No <Say> here; the greeting will come from realtime.py
     vr.connect().stream(url=f"wss://{host}/ws")
     return PlainTextResponse(str(vr), media_type="application/xml")
 
