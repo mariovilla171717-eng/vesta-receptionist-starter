@@ -123,24 +123,26 @@ async def ws_endpoint(twilio_ws: WebSocket):
             pass
 
     async def hard_cancel():
-        """Stop bot speech immediately (no more audio to Twilio) and cancel model turn."""
-        nonlocal speaking, suppress_outbound, current_response_id
-        suppress_outbound = True
-        speaking = False
-        try:
-            if current_response_id:
-                await openai_ws.send(json.dumps({"type": "response.cancel", "response": {"id": current_response_id}}))
-            await openai_ws.send(json.dumps({"type": "response.cancel"}))
-            await openai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
-        except:
-            pass
-        current_response_id = None
+    """Stop bot speech immediately and cancel the current model turn."""
+    nonlocal speaking, suppress_outbound, current_response_id
+    suppress_outbound = True      # drop any more audio frames from this response
+    speaking = False
+    try:
+        # Try targeted cancel (if we have an id), then generic cancel twice (belt & suspenders)
+        if current_response_id:
+            await openai_ws.send(json.dumps({"type": "response.cancel", "response": {"id": current_response_id}}))
+        await openai_ws.send(json.dumps({"type": "response.cancel"}))
+        await openai_ws.send(json.dumps({"type": "response.cancel"}))
+        # Clear any partial buffers so nothing leftover gets spoken
+        await openai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+    except:
+        pass
+    current_response_id = None
 
     # --- barge-in gate (noise immune) ---
-    FRAME_MS = 20
-    RMS_GATE = 6000          # a bit more sensitive to your voice
-    LOUD_MS_REQUIRED = 80    # triggers in ~80ms of real speech
-    loud_ms_accum = 0
+FRAME_MS = 20
+RMS_GATE = 5500          # a bit more sensitive to your voice
+LOUD_MS_REQUIRED = 60    # ~60 ms of sustained voice -> cancel
 
     async def twilio_to_openai():
         nonlocal loud_ms_accum, suppress_outbound
