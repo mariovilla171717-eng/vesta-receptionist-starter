@@ -14,5 +14,10 @@ async def voice(request: Request):
     base = os.environ.get("BASE_URL", "https://example.com")
     host = base.split("://")[1]
 
+    vr = VoiceResponse()
+    # No <Say> here; the greeting will come from realtime.py
+    vr.connect().stream(url=f"wss://{host}/ws")
+    return PlainTextResponse(str(vr), media_type="application/xml")
+
 from realtime import router as realtime_router
 app.include_router(realtime_router)
