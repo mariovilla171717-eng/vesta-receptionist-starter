@@ -138,8 +138,8 @@ async def ws_endpoint(twilio_ws: WebSocket):
 
     # --- barge-in gate (noise immune) ---
     FRAME_MS = 20
-    LOUD_MS_REQUIRED = 120   # ~120ms of real voice to trigger barge-in
-    RMS_GATE = 8000          # higher = less sensitive, lower = more
+    RMS_GATE = 6000          # a bit more sensitive to your voice
+    LOUD_MS_REQUIRED = 80    # triggers in ~80ms of real speech
     loud_ms_accum = 0
 
     async def twilio_to_openai():
