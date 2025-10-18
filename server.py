@@ -12,9 +12,13 @@ def health():
 @app.post("/voice")
 async def voice(request: Request):
     base = os.environ.get("BASE_URL", "https://example.com")
+    host = base.split("://")[1]
+
     vr = VoiceResponse()
-    # Directly connect stream; greeting comes from AI immediately
-    vr.connect().stream(url=f"wss://{base.split('://')[1]}/ws")
+    # Twilio speaks this immediately (no waiting on the AI)
+    vr.say("Hi, thanks for calling Vesta. How can I help you today?")
+    # Start the bidirectional stream right after the greeting
+    vr.connect().stream(url=f"wss://{host}/ws")
     return PlainTextResponse(str(vr), media_type="application/xml")
 
 from realtime import router as realtime_router
